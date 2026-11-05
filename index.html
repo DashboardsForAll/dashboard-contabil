@@ -561,8 +561,10 @@ function bpAccounts(y){
 function stmtBP(){
   if(isAll()) return bpComparativo();
   if(isMonth()) return bpMes();
-  const {d, by} = bpAccounts(state.year);
-  const grp = (cl,g) => d.contas.filter(c=>c.cl===cl&&c.g===g);
+  const {d, by:byRaw} = bpAccounts(state.year);
+  const sgn = cod => /^[23]\./.test(cod) ? -1 : 1;
+  const by = cod => sgn(cod)*byRaw(cod);
+  const grp = (cl,g) => d.contas.filter(c=>c.cl===cl&&c.g===g).map(c=>({...c, v:sgn(c.cod)*c.v}));
   const ac = grp('Ativo','Ativo Circulante'), anc = grp('Ativo','Ativo Não Circulante');
   const pc = grp('Passivo','Passivo Circulante');
   const capital = by(COD.cap), lucros = by(COD.luc);
@@ -570,7 +572,7 @@ function stmtBP(){
   const totPC = -pc.reduce((a,c)=>a+c.v,0);
   const pl = -capital - lucros + d.resultado_acum;
   const yPrev = state.year>Y0 ? state.year-1 : null;
-  const byP = yPrev ? bpAccounts(yPrev).by : null;
+  const byP = yPrev ? (cod => sgn(cod)*bpAccounts(yPrev).by(cod)) : null;
   const dP = yPrev ? DATA.balanco[yPrev] : null;
   const at = d.total_ativo;
   const prevH = yPrev ? String(yPrev) : '—';
@@ -581,7 +583,7 @@ function stmtBP(){
     return '<tr class="ind"><td>'+esc(c.n)+nrefSub(c.s)+'</td><td>'+fmc(v)+'</td>'+pcell(p)+fav(v,at)+fah(v,p)+'</tr>';
   }).join('');
   const trow = (nome, v, p, cls) => '<tr class="'+cls+'"><td>'+nome+'</td><td>'+(cls==='tot'?fm(v):fmc(v))+'</td>'+pcell(p)+fav(v,at)+fah(v,p)+'</tr>';
-  const sumP = (cl,g) => dP ? dP.contas.filter(c=>c.cl===cl&&c.g===g).reduce((a,c)=>a+c.v,0) : null;
+  const sumP = (cl,g) => dP ? dP.contas.filter(c=>c.cl===cl&&c.g===g).reduce((a,c)=>a+sgn(c.cod)*c.v,0) : null;
   const plP = dP ? -byP(COD.cap) - byP(COD.luc) + dP.resultado_acum : null;
   const ativo =
     '<div class="card"><h3>ATIVO <span class="sub">31/12/'+state.year+' · AV sobre o ativo total · AH vs '+(yPrev||'—')+'</span></h3><div class="tbl-scroll mt"><table class="ledger">'+head4+
@@ -610,7 +612,7 @@ function stmtBP(){
 }
 function bpMes(){
   const y = state.year, m = state.month;
-  const val = cod => bpSaldoM(y,cod,m);
+  const val = cod => { const raw = bpSaldoM(y,cod,m); return /^[23]\./.test(cod) ? -raw : raw; };
   const grp = (cl,g) => BP_META.filter(c=>c.cl===cl&&c.g===g).map(c=>({...c, v:val(c.cod)}));
   const ac = grp('Ativo','Ativo Circulante'), anc = grp('Ativo','Ativo Não Circulante');
   const pc = grp('Passivo','Passivo Circulante');
@@ -621,7 +623,7 @@ function bpMes(){
   const totPC = -pc.reduce((a,c)=>a+c.v,0);
   const pl = -capital - lucros + resAcum;
   const ref = mLabel();
-  const prevOf = cod => m>1 ? bpSaldoM(y,cod,m-1) : (y>Y0 ? bpSaldoM(y-1,cod,12) : null);
+  const prevOf = cod => { const raw = m>1 ? bpSaldoM(y,cod,m-1) : (y>Y0 ? bpSaldoM(y-1,cod,12) : null); return raw===null ? null : (/^[23]\./.test(cod) ? -raw : raw); };
   const refPrev = m>1 ? MESES[m-2]+'/'+String(y).slice(2) : (y>Y0 ? 'dez/'+String(y-1).slice(2) : '—');
   const head4 = '<tr><th></th><th>R$</th><th>AV %</th><th>AH %</th></tr>';
   const rows = (arr,inv) => arr.map(c=>{
