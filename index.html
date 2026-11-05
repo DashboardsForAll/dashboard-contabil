@@ -134,6 +134,9 @@ table.data th:first-child{text-align:left}
 table.data td{padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--text);
   border-bottom:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
 table.data td:first-child{text-align:left;font-family:var(--sans);color:var(--muted);white-space:normal}
+table.data.acoes td{white-space:normal;text-align:left;font-family:var(--sans);font-size:12px;vertical-align:top;line-height:1.5}
+table.data.acoes td:first-child{min-width:130px}
+table.data.acoes td:last-child{text-align:right}
 table.data tr:last-child td{border-bottom:none}
 table.data tr:hover td{background:rgba(255,255,255,.015)}
 .badge{display:inline-block;font-family:var(--mono);font-size:9.5px;letter-spacing:.08em;padding:2px 8px;border-radius:20px;border:1px solid}
@@ -287,7 +290,7 @@ function fm(v){ // ledger style: parentheses for negatives
   return v < -0.004 ? '('+s+')' : s;
 }
 function fmc(v){ return v<0 ? '<span class="n">'+fm(v)+'</span>' : fm(v); }
-function money(v){ return milOn() ? 'R$ '+nf1.format(v/1000)+' mil' : 'R$ '+nf0.format(v); }
+function money(v){ if(Math.abs(v)<0.5) v = 0; return milOn() ? 'R$ '+nf1.format(v/1000)+' mil' : 'R$ '+nf0.format(v); }
 function compact(v){
   const a = Math.abs(v), sg = v<0?'−':'';
   if(a>=1e6) return sg+'R$ '+(a/1e6).toLocaleString('pt-BR',{maximumFractionDigits:2})+' mi';
@@ -306,6 +309,100 @@ const compLabel = c => MESES[+c.slice(5,7)-1]+'/'+c.slice(0,4);
 /* metadados de contas patrimoniais (master 2025) */
 const BP_META = DATA.bp_meta;
 function bpSaldoM(y,cod,m){ const s=DATA.bp_saldos_m[y][cod]; return s?s[m-1]:0; }
+
+/* ===================== NORMALIZAÇÃO CONTÁBIL (revisão técnica) =====================
+   Ajustes de apresentação sobre a base de origem, sem alterar o Razão nem os saldos:
+   1. DFC indireta — D&A somada ao resultado, variação do capital de giro aberta por conta a partir
+      do Balanço e integralização de capital em bens (estoques e máquinas) excluída dos fluxos de
+      caixa, por ser transação que não envolve caixa (CPC 03, item 43).
+   2. DVA — sinais normalizados; tributos recuperáveis incluídos nos insumos, impostos pelo valor
+      líquido devido e aluguéis como remuneração de capitais de terceiros (CPC 09).
+   3. DMPL — saldo de abertura de 2021 zerado e integralização de capital evidenciada.
+   4. Imobilizado / intangível — ativos totalmente depreciados/amortizados mantidos no razão auxiliar.
+   5. DRE — resultado operacional (EBIT) explícito. */
+const RZ_ANO = (()=>{                       /* débitos e créditos anuais por conta, a partir do Razão */
+  const o = {};
+  for(const [cod, ls] of Object.entries(DATA.razao.linhas)) for(const l of ls){
+    const k = cod+'|'+new Date(Y0,0,1+l[0]).getFullYear();
+    const a = o[k] || (o[k] = {d:0, c:0}); a.d += l[4]; a.c += l[5];
+  }
+  return o;
+})();
+const rzAno = (cod, y) => RZ_ANO[cod+'|'+y] || {d:0, c:0};
+const ABERT = (()=>{                        /* lançamento de abertura (integralização de capital) */
+  const iAb = DATA.razao.mod.indexOf('Abertura'), o = {};
+  if(iAb < 0) return o;
+  for(const [cod, ls] of Object.entries(DATA.razao.linhas)) for(const l of ls)
+    if(l[1]===iAb) o[cod] = (o[cod]||0) + l[4] - l[5];
+  return o;
+})();
+const BPV = (y, cod) => { if(!DATA.balanco[y]) return 0; const c = DATA.balanco[y].contas.find(x=>x.cod===cod); return c ? c.v : 0; };
+const BPG = (y, pred) => DATA.balanco[y] ? DATA.balanco[y].contas.filter(pred).reduce((a,c)=>a+c.v,0) : 0;
+const isCustoANC = c => c.g==='Ativo Não Circulante' && !/\.99$/.test(c.cod);
+(function normalizar(){
+  YEARS.forEach(y=>{
+    const a = DATA.dre[y].annual, p = y-1, ini = y===Y0;
+    /* 5 · EBIT */
+    a.EBIT = a.Lucro_Bruto + a.Despesas_Operacionais;
+    DATA.dre_m[y].EBIT = DATA.dre_m[y].Lucro_Bruto.map((v,i)=>v + DATA.dre_m[y].Despesas_Operacionais[i]);
+    /* 1 · DFC indireta reconstruída a partir do Balanço */
+    const dlt = cod => BPV(y,cod) - BPV(p,cod);
+    const dG = pred => BPG(y,pred) - BPG(p,pred);
+    const ncEst = ini ? (ABERT[COD.est]||0) : 0;
+    const ncImob = ini ? Object.entries(ABERT).filter(([c])=>/^1\.2\./.test(c)).reduce((s,[,v])=>s+v,0) : 0;
+    const dCli = dlt(COD.cli), dEst = dlt(COD.est) - ncEst;
+    const dRec = dG(c=>c.cl==='Ativo' && c.s==='Tributos a Recuperar');
+    const dForn = dG(c=>c.cl==='Passivo' && c.s==='Fornecedores');
+    const dFisc = dG(c=>c.cl==='Passivo' && c.s==='Fiscal');
+    const dTrab = dG(c=>c.cl==='Passivo' && c.s==='Trabalhista');
+    const capex = dG(isCustoANC) - ncImob;
+    const da = Math.abs(a.DA), ll = a.Lucro_Liquido;
+    const dwc = -dCli - dEst - dRec + dForn + dFisc + dTrab;
+    const oper = ll + da + dwc;
+    const fin = dlt(COD.cap) - ncEst - ncImob;            /* integralização em espécie */
+    const f = DATA.dfc[y];
+    f.ind = {ll, dep:da, dwc, oper, invest:-capex, fin, dCli, dEst, dRec, dForn, dFisc, dTrab,
+             naoCaixa:ncEst+ncImob, ncEst, ncImob};
+    const irDesp = -a.IRPJ_CSLL, dIR = dlt('2.1.3.04') + dlt('2.1.3.05');
+    f.extra.ir_pago = irDesp - dIR;                        /* regime de caixa, não de competência */
+    f.extra.trib_consumo = f.extra.trib_pagos - f.extra.ir_pago;
+    /* 2 · DVA (CPC 09) */
+    const v = DATA.dva[y];
+    const credUsados = DATA.imp[y].trib.filter(t=>['ICMS','PIS','COFINS'].includes(t.n)).reduce((s,t)=>s+(t.db-t.vr),0);
+    const r = rzAno('5.2.2.01', y), alug = r.d - r.c;
+    const receitas = Math.abs(v.receitas), insumos = Math.abs(v.insumos) + credUsados - alug;
+    const retencoes = Math.abs(v.retencoes), va_bruto = receitas - insumos, va_liquido = va_bruto - retencoes;
+    const juros = Math.abs(v.cap_terceiros);
+    DATA.dva[y] = {receitas, insumos, va_bruto, retencoes, va_liquido,
+      pessoal:Math.abs(v.pessoal), impostos:Math.abs(v.impostos) - credUsados,
+      juros, alugueis:alug, cap_terceiros:juros + alug, retidos:v.retidos, cred_tributos:credUsados};
+  });
+  /* 3 · DMPL — integralização inicial */
+  const capAb = -(ABERT[COD.cap]||0);
+  if(capAb > 0.005){
+    const d = DATA.dmpl[Y0];
+    d.cap_ini = 0; d.integ = capAb;
+    d.integ_caixa = ABERT[COD.cx]||0; d.integ_bens = capAb - d.integ_caixa;
+  }
+  /* 4 · ativos totalmente depreciados/amortizados continuam no auxiliar (custo = depreciação acumulada) */
+  ['imob','intang'].forEach(k=>{
+    const A = DATA[k];
+    YEARS.forEach(y=>{
+      const ac = A[y].acum, rs = A[y].resid || (A[y].resid = {});
+      A.ativos.forEach(x=>{
+        if(x.dt > y+'-12-31' || ac[x.id]!==undefined) return;
+        const [yy, mm] = x.dt.split('-').map(Number);
+        if((y-yy)*12 + (12-mm) + 1 >= x.vu){ ac[x.id] = x.v; rs[x.id] = 0; }
+      });
+    });
+  });
+})();
+/* prazos médios pelos saldos das demonstrações (saldo final × 360 / fluxo anual) */
+function prazosBP(y){
+  const rb = DATA.dre[y].annual.Receita_Bruta;
+  const compras = rzAno('2.1.1.01', y).c;                  /* créditos em Fornecedores = compras a prazo */
+  return {pmr: BPV(y,COD.cli)/rb*360, pmp: BPG(y,c=>c.cl==='Passivo'&&c.s==='Fornecedores')/compras*360};
+}
 let charts = [];
 function killCharts(){ charts.forEach(c=>c.destroy()); charts=[]; }
 function mkChart(id, cfg){
@@ -466,7 +563,7 @@ function kpi(label, value, cls, foot){
 
 /* referências às notas explicativas */
 const NOTA_SUB = {'Disponibilidades':4,'Clientes':5,'Estoques':6,'Tributos a Recuperar':7,
-  'Imobilizado':8,'Intangível':9,'Fornecedores':10,'Trabalhista':11,'Tributos':11,
+  'Imobilizado':8,'Intangível':9,'Fornecedores':10,'Trabalhista':11,'Tributos':11,'Fiscal':11,
   'Capital':13,'Resultado':13};
 function nref(n){ return n ? '<a class="nref" data-nota="'+n+'">N'+n+'</a>' : ''; }
 function nrefSub(s){ return nref(NOTA_SUB[s]); }
@@ -509,8 +606,8 @@ function demoKpis(){
   if(isAll()){
     rl = sumYears(y=>DATA.dre[y].annual.Receita_Liquida);
     ll = sumYears(y=>DATA.dre[y].annual.Lucro_Liquido);
-    at = DATA.balanco[2025].total_ativo;
-    cx = DATA.dfc[2025].caixa_fim;
+    at = DATA.balanco[YL].total_ativo;
+    cx = DATA.dfc[YL].caixa_fim;
     lab = yearLabel(); atLab = String(lastM(YL)).padStart(2,'0')+'/'+YL;
   } else if(isMonth()){
     const y = state.year, m = state.month;
@@ -548,10 +645,11 @@ function tabsPost(){
 
 /* ---------- Balanço Patrimonial ---------- */
 function fav(v, base){ return '<td style="color:var(--dim)">'+(base?pct(v/base):'—')+'</td>'; }
-function fah(cur, prev){
+function fah(cur, prev, custo){
+  /* análise horizontal sobre o valor apresentado; em linhas de custo/despesa o aumento é desfavorável */
   if(prev===null || prev===undefined || Math.abs(prev)<0.005) return '<td style="color:var(--dim)">—</td>';
-  const d = (cur-prev)/Math.abs(prev);
-  return '<td class="'+(d>=0?'vp':'vn')+'" style="font-size:11px">'+(d>=0?'+':'')+pct(d)+'</td>';
+  const d = (cur-prev)/Math.abs(prev), fav = custo ? d<=0 : d>=0;
+  return '<td class="'+(fav?'vp':'vn')+'" style="font-size:11px">'+(d>=0?'+':'')+pct(d)+'</td>';
 }
 function bpAccounts(y){
   const d = DATA.balanco[y];
@@ -662,25 +760,37 @@ function bpMes(){
     '<div class="card"><h3>Composição do Passivo e PL <span class="sub">'+ref+'</span></h3><div class="chartbox"><canvas id="ch-bp3"></canvas></div></div></div>';
 }
 function bpComparativo(){
-  const codes = [];
-  DATA.balanco[2025].contas.forEach(c=>codes.push(c));
-  const val = (y,cod)=>{ const c=DATA.balanco[y].contas.find(x=>x.cod===cod); return c?c.v:0; };
-  const head = '<tr><th>Conta</th>'+YEARS.map(y=>'<th>12/'+y+'</th>').join('')+'</tr>';
+  /* Saldos na natureza de cada grupo: ativo devedor positivo; passivo e PL credores apresentados
+     positivos (a base guarda contas credoras com sinal positivo). Contas redutoras do ativo
+     — depreciação e amortização acumuladas — permanecem negativas. */
+  const codes = DATA.balanco[YL].contas.slice();
+  const val = (y,cod) => BPV(y,cod);
+  const ncol = YEARS.length + 1;
+  const head = '<tr><th>Conta</th>'+YEARS.map(y=>'<th>31/12/'+y+'</th>').join('')+'</tr>';
   const line = (nome, get, cls, ind) => '<tr class="'+(cls||'')+' '+(ind?'ind':'')+'"><td>'+nome+'</td>'+
-    YEARS.map(y=>'<td>'+fmc(get(y))+'</td>').join('')+'</tr>';
-  const sumG = (y,cl,g)=>DATA.balanco[y].contas.filter(c=>c.cl===cl&&c.g===g).reduce((a,c)=>a+c.v,0);
-  let h = '<tr class="sec"><td colspan="6">Ativo</td></tr>';
-  codes.filter(c=>c.cl==='Ativo').forEach(c=>{ h += line(esc(c.n), y=>val(y,c.cod), '', true); });
+    YEARS.map(y=>'<td>'+(cls==='tot'?fm(get(y)):fmc(get(y)))+'</td>').join('')+'</tr>';
+  const sumG = (y,cl,g) => BPG(y, c=>c.cl===cl && c.g===g);
+  const capital = y => val(y,COD.cap);
+  const lucros = y => val(y,COD.luc) + DATA.balanco[y].resultado_acum;
+  const totPL = y => capital(y) + lucros(y);
+  const totPC = y => sumG(y,'Passivo','Passivo Circulante');
+  const grupo = (cl, g) => codes.filter(c=>c.cl===cl && c.g===g).map(c=>line(esc(c.n)+nrefSub(c.s), y=>val(y,c.cod), '', true)).join('');
+  let h = '<tr class="sec"><td colspan="'+ncol+'">Ativo Circulante</td></tr>' + grupo('Ativo','Ativo Circulante');
+  h += line('Total do Ativo Circulante', y=>sumG(y,'Ativo','Ativo Circulante'), 'sub');
+  h += '<tr class="sec"><td colspan="'+ncol+'">Ativo Não Circulante</td></tr>' + grupo('Ativo','Ativo Não Circulante');
+  h += line('Total do Ativo Não Circulante', y=>sumG(y,'Ativo','Ativo Não Circulante'), 'sub');
   h += line('TOTAL DO ATIVO', y=>DATA.balanco[y].total_ativo, 'tot');
-  h += '<tr class="sec"><td colspan="6">Passivo</td></tr>';
-  codes.filter(c=>c.cl==='Passivo').forEach(c=>{ h += line(esc(c.n), y=>-val(y,c.cod), '', true); });
-  h += line('Total do Passivo', y=>DATA.balanco[y].total_passivo, 'sub');
-  h += '<tr class="sec"><td colspan="6">Patrimônio Líquido</td></tr>';
-  h += line('Capital Social', y=>-val(y,COD.cap), '', true);
-  h += line('Lucros ou Prejuízos Acumulados', y=>-val(y,COD.luc)+DATA.balanco[y].resultado_acum, '', true);
-  h += line('TOTAL DO PASSIVO + PL', y=>DATA.balanco[y].total_passivo + DATA.balanco[y].pl + DATA.balanco[y].resultado_acum, 'tot');
-  return '<div class="card"><h3>Balanço Patrimonial Comparativo <span class="sub">'+Y0+'–'+YL+' · R$</span></h3>'+
-    '<div class="tbl-scroll mt"><table class="ledger">'+head+h+'</table></div></div>'+
+  h += '<tr class="sec"><td colspan="'+ncol+'">Passivo Circulante</td></tr>' + grupo('Passivo','Passivo Circulante');
+  h += line('Total do Passivo Circulante', totPC, 'sub');
+  h += '<tr class="sec"><td colspan="'+ncol+'">Patrimônio Líquido</td></tr>';
+  h += line('Capital Social'+nref(13), capital, '', true);
+  h += line('Lucros ou Prejuízos Acumulados'+nref(13), lucros, '', true);
+  h += line('Total do Patrimônio Líquido', totPL, 'sub');
+  h += line('TOTAL DO PASSIVO + PL', y=>totPC(y) + totPL(y), 'tot');
+  const difMax = Math.max(...YEARS.map(y=>Math.abs(DATA.balanco[y].total_ativo - totPC(y) - totPL(y))));
+  return '<div class="card"><h3>Balanço Patrimonial Comparativo <span class="sub">'+Y0+'–'+YL+' · R$ · posições de 31 de dezembro</span></h3>'+
+    '<div class="tbl-scroll mt"><table class="ledger">'+head+h+'</table></div>'+
+    '<div class="section-note">Passivo e patrimônio líquido apresentados pelos saldos credores (positivos); depreciação e amortização acumuladas aparecem entre parênteses como contas redutoras do ativo. Equação patrimonial verificada em todos os exercícios: Ativo = Passivo + PL · maior diferença '+(difMax<0.005?'R$ 0,00 ✓':money(difMax))+'.</div></div>'+
     '<div class="grid g2 mt"><div class="card"><h3>Ativo Total <span class="sub">fechamento anual</span></h3><div class="chartbox"><canvas id="ch-bp"></canvas></div></div>'+
     '<div class="card"><h3>Estrutura de capital <span class="sub">Passivo vs PL</span></h3><div class="chartbox"><canvas id="ch-bp2"></canvas></div></div></div>';
 }
@@ -717,15 +827,16 @@ function postBP(){
     const gp = {};
     if(isMonth()){
       const m = state.month;
-      BP_META.filter(c=>c.cl==='Passivo').forEach(c=>{ gp[c.s]=(gp[c.s]||0)-bpSaldoM(state.year,c.cod,m); });
-      gp['Capital Social'] = -bpSaldoM(state.year,COD.cap,m);
-      gp['Lucros Acumulados'] = -bpSaldoM(state.year,COD.luc,m) + DATA.res_acum_m[state.year][m-1];
+      /* contas credoras guardadas com saldo positivo na base */
+      BP_META.filter(c=>c.cl==='Passivo').forEach(c=>{ gp[c.s]=(gp[c.s]||0)+bpSaldoM(state.year,c.cod,m); });
+      gp['Capital Social'] = bpSaldoM(state.year,COD.cap,m);
+      gp['Lucros Acumulados'] = bpSaldoM(state.year,COD.luc,m) + DATA.res_acum_m[state.year][m-1];
     } else {
       const {d:db} = bpAccounts(state.year);
-      db.contas.filter(c=>c.cl==='Passivo').forEach(c=>{ gp[c.s]=(gp[c.s]||0)-c.v; });
+      db.contas.filter(c=>c.cl==='Passivo').forEach(c=>{ gp[c.s]=(gp[c.s]||0)+c.v; });
       const byP = code => { const c = db.contas.find(x=>x.cod===code); return c?c.v:0; };
-      gp['Capital Social'] = -byP(COD.cap);
-      gp['Lucros Acumulados'] = -byP(COD.luc) + db.resultado_acum;
+      gp['Capital Social'] = byP(COD.cap);
+      gp['Lucros Acumulados'] = byP(COD.luc) + db.resultado_acum;
     }
     const entP = Object.entries(gp).filter(([,v])=>Math.abs(v)>0.5).sort((a,b)=>b[1]-a[1]);
     mkChart('ch-bp3',{type:'doughnut',data:{labels:entP.map(e=>e[0]),datasets:[{data:entP.map(e=>Math.abs(e[1])),
@@ -741,19 +852,23 @@ function postBP(){
 function dreLines(get){
   return [
     ['Receita Bruta de Vendas e Serviços'+nref(14),'Receita_Bruta',''],
-    ['(−) Deduções da Receita — ICMS, PIS e COFINS'+nref(11),'Deducoes','neg'],
+    ['(−) Deduções da Receita — ICMS, PIS e COFINS'+nref(14),'Deducoes','neg'],
     ['(=) Receita Líquida','Receita_Liquida','sub'],
     ['(−) Custo das Mercadorias e Serviços (CMV)'+nref(6),'CMV_Custos','neg'],
     ['(=) Lucro Bruto','Lucro_Bruto','sub'],
     ['(−) Despesas Operacionais','Despesas_Operacionais','neg'],
-    ['(±) Resultado Financeiro','Resultado_Financeiro',''],
+    ['Despesas com pessoal e encargos','Pessoal','ind'],
+    ['Depreciação e amortização'+nref(8),'DA','ind'],
+    ['Outras despesas operacionais — ocupação, comerciais, serviços e gerais','DespOutras','ind'],
+    ['(=) Resultado Operacional antes do Resultado Financeiro — EBIT','EBIT','sub'],
+    ['(±) Resultado Financeiro — despesas bancárias','Resultado_Financeiro',''],
     ['(=) Resultado Antes do IRPJ e da CSLL — LAIR','LAIR','sub'],
     ['(−) IRPJ e CSLL — Lucro Real'+nref(15),'IRPJ_CSLL','neg'],
     ['(=) RESULTADO LÍQUIDO DO EXERCÍCIO','Lucro_Liquido','tot']
   ];
 }
 function stmtDRE(){
-  const sign = k => ['Deducoes','CMV_Custos','Despesas_Operacionais','IRPJ_CSLL'].includes(k) ? -1 : 1;
+  const sign = k => ['Deducoes','CMV_Custos','Despesas_Operacionais','IRPJ_CSLL','Pessoal','DA','DespOutras'].includes(k) ? -1 : 1;
   let table;
   if(isAll()){
     const head='<tr><th></th>'+YEARS.map(y=>'<th>'+y+'</th>').join('')+'<th>Acum.</th></tr>';
@@ -770,7 +885,7 @@ function stmtDRE(){
     table = '<table class="ledger"><tr><th></th><th>'+mLabel()+' · R$</th><th>AV %</th><th>AH % vs '+MESES[m-1]+'/'+(state.year>Y0?String(state.year-1).slice(2):'—')+'</th><th>Acum. Jan–'+MESES[m-1]+'</th></tr>'+
       dreLines().map(([n,k,cls])=>{
         const v = sign(k)*M[k][m-1], a = sign(k)*ytd(k);
-        return '<tr class="'+cls+'"><td>'+n+'</td><td>'+fmc(v)+'</td><td style="color:var(--dim)">'+pct(M[k][m-1]/rlM*sign(k))+'</td>'+fah(M[k][m-1], MP?MP[k][m-1]:null)+'<td>'+fmc(a)+'</td></tr>';
+        return '<tr class="'+cls+'"><td>'+n+'</td><td>'+fmc(v)+'</td><td style="color:var(--dim)">'+pct(M[k][m-1]/rlM*sign(k))+'</td>'+fah(sign(k)*M[k][m-1], MP?sign(k)*MP[k][m-1]:null, sign(k)<0)+'<td>'+fmc(a)+'</td></tr>';
       }).join('')+'</table>';
   } else {
     const a = DATA.dre[state.year].annual;
@@ -780,7 +895,7 @@ function stmtDRE(){
     table = '<table class="ledger"><tr><th></th><th>'+state.year+' · R$</th><th>'+prevH+'</th><th>AV %</th><th>AH %</th></tr>'+
       dreLines().map(([n,k,cls])=>{
         const v = sign(k)*a[k], vP = aP ? sign(k)*aP[k] : null;
-        return '<tr class="'+cls+'"><td>'+n+'</td><td>'+fmc(v)+'</td><td style="color:var(--muted)">'+(vP===null?'—':fmc(vP))+'</td><td style="color:var(--dim)">'+pct(a[k]/rlAbs*sign(k))+'</td>'+fah(a[k], aP?aP[k]:null)+'</tr>';
+        return '<tr class="'+cls+'"><td>'+n+'</td><td>'+fmc(v)+'</td><td style="color:var(--muted)">'+(vP===null?'—':fmc(vP))+'</td><td style="color:var(--dim)">'+pct(a[k]/rlAbs*sign(k))+'</td>'+fah(v, vP, sign(k)<0)+'</tr>';
       }).join('')+'</table>';
   }
   const despCard = despesasCard();
@@ -894,7 +1009,7 @@ function postDRA(){
 /* ---------- DVA ---------- */
 function dvaAgg(){
   if(!isAll()) return DATA.dva[state.year];
-  const keys = Object.keys(DATA.dva[2021]); const o = {};
+  const keys = Object.keys(DATA.dva[Y0]); const o = {};
   keys.forEach(k=>o[k]=sumYears(y=>DATA.dva[y][k]));
   return o;
 }
@@ -906,27 +1021,33 @@ function stmtDVA(){
   const table = '<table class="ledger"><tr><th></th><th>'+yearLabel()+' · R$</th><th>% VA</th></tr>'+
     '<tr class="sec"><td colspan="3">1 · Geração do valor adicionado</td></tr>'+
     '<tr class="ind"><td>Receitas — vendas de mercadorias e serviços</td><td>'+fm(d.receitas)+'</td><td></td></tr>'+
-    '<tr class="ind"><td>(−) Insumos adquiridos de terceiros — CMV, materiais, energia e serviços</td><td>'+fm(-d.insumos)+'</td><td></td></tr>'+
+    '<tr class="ind"><td>(−) Insumos adquiridos de terceiros — CMV, materiais, energia e serviços (inclui tributos recuperáveis)</td><td>'+fm(-d.insumos)+'</td><td></td></tr>'+
     '<tr class="sub"><td>Valor adicionado bruto</td><td>'+fmc(d.va_bruto)+'</td><td></td></tr>'+
     '<tr class="ind"><td>(−) Retenções — depreciação e amortização</td><td>'+fm(-d.retencoes)+'</td><td></td></tr>'+
     '<tr class="tot"><td>VALOR ADICIONADO LÍQUIDO A DISTRIBUIR</td><td>'+fm(d.va_liquido)+'</td><td>100%</td></tr>'+
     '<tr class="sec"><td colspan="3">2 · Distribuição do valor adicionado</td></tr>'+
     '<tr class="ind"><td>Pessoal — remuneração direta, benefícios e FGTS</td><td>'+fm(d.pessoal)+'</td><td>'+p(d.pessoal)+'</td></tr>'+
-    '<tr class="ind"><td>Impostos, taxas e contribuições — federais e estaduais</td><td>'+fm(d.impostos)+'</td><td>'+p(d.impostos)+'</td></tr>'+
-    '<tr class="ind"><td>Remuneração de capitais de terceiros — juros e despesas bancárias</td><td>'+fm(d.cap_terceiros)+'</td><td>'+p(d.cap_terceiros)+'</td></tr>'+
+    '<tr class="ind"><td>Impostos, taxas e contribuições — ICMS, PIS e COFINS líquidos dos créditos + IRPJ e CSLL</td><td>'+fm(d.impostos)+'</td><td>'+p(d.impostos)+'</td></tr>'+
+    '<tr class="ind"><td>Remuneração de capitais de terceiros — juros e despesas bancárias</td><td>'+fm(d.juros)+'</td><td>'+p(d.juros)+'</td></tr>'+
+    '<tr class="ind"><td>Remuneração de capitais de terceiros — aluguéis</td><td>'+fm(d.alugueis)+'</td><td>'+p(d.alugueis)+'</td></tr>'+
     '<tr class="ind"><td>Remuneração de capitais próprios — lucros retidos / (prejuízo)</td><td>'+fmc(d.retidos)+'</td><td>'+p(d.retidos)+'</td></tr>'+
     '<tr class="tot"><td>TOTAL DISTRIBUÍDO</td><td>'+fm(dist)+'</td><td>100%</td></tr>'+
     '</table>';
   return nota+'<div class="grid g23"><div class="card"><h3>Demonstração do Valor Adicionado <span class="sub">'+yearLabel()+' · CPC 09</span></h3>'+
     '<div class="tbl-scroll mt">'+table+'</div>'+
-    '<div class="section-note">Riqueza gerada pela operação e sua distribuição entre os agentes econômicos. Distribuição fecha 100% com o valor adicionado líquido.</div></div>'+
+    '<div class="section-note">Riqueza gerada pela operação e sua distribuição entre os agentes econômicos (CPC 09). Os insumos incluem os créditos de ICMS, PIS e COFINS aproveitados ('+compact(d.cred_tributos)+') e os impostos são distribuídos pelo valor líquido devido; os aluguéis são remuneração de capitais de terceiros. Distribuição fecha 100% com o valor adicionado líquido'+(Math.abs(dist-d.va_liquido)<0.5?' ✓':' — diferença de '+money(dist-d.va_liquido))+'.</div></div>'+
     '<div class="card"><h3>Distribuição da riqueza <span class="sub">'+yearLabel()+'</span></h3><div class="chartbox tall"><canvas id="ch-dva"></canvas></div></div></div>';
 }
 function postDVA(){
   const d = dvaAgg();
-  mkChart('ch-dva',{type:'doughnut',data:{labels:['Pessoal','Impostos e contribuições','Capitais de terceiros','Lucros retidos / prejuízo'],
-    datasets:[{data:[d.pessoal,d.impostos,d.cap_terceiros,d.retidos],backgroundColor:[C.steel,C.brass,C.neg,C.pos],borderColor:'#12151C',borderWidth:2}]},
-    options:{maintainAspectRatio:false,cutout:'60%',plugins:{legend:legendOpt(),tooltip:ttipDefault}}});
+  /* fatia com valor negativo (prejuízo) não é representável em rosca — exibida pelo módulo e identificada no rótulo */
+  const lbl = ['Pessoal','Impostos e contribuições','Capitais de terceiros', d.retidos<0?'Prejuízo absorvido':'Lucros retidos'];
+  const vals = [d.pessoal,d.impostos,d.cap_terceiros,d.retidos];
+  mkChart('ch-dva',{type:'doughnut',data:{labels:lbl,
+    datasets:[{data:vals.map(Math.abs),backgroundColor:[C.steel,C.brass,C.neg,d.retidos<0?'#8B93A3':C.pos],borderColor:'#12151C',borderWidth:2}]},
+    options:{maintainAspectRatio:false,cutout:'60%',plugins:{legend:legendOpt(),tooltip:{...ttip,callbacks:{label:c=>{
+      const v = vals[c.dataIndex]; return ' '+c.label+': '+(v<0?'('+money(-v).slice(3)+')':money(v))+' · '+pct(v/d.va_liquido)+' do VA';
+    }}}}}});
 }
 
 /* ---------- DMPL ---------- */
@@ -937,13 +1058,13 @@ function stmtDMPL(){
     const d = DATA.dmpl[y];
     return '<tr class="sec"><td colspan="4">Exercício '+y+'</td></tr>'+
     '<tr class="ind"><td>Saldos em 01/01/'+y+'</td><td>'+fm(d.cap_ini)+'</td><td>'+fmc(d.res_ini)+'</td><td>'+fmc(d.cap_ini+d.res_ini)+'</td></tr>'+
-    (y===2021?'<tr class="ind"><td>Integralização de capital</td><td>'+fm(0)+'</td><td>–</td><td>'+fm(0)+'</td></tr>':'')+
+    (d.integ?'<tr class="ind"><td>Integralização de capital — '+compact(d.integ_caixa)+' em dinheiro e '+compact(d.integ_bens)+' em bens (estoques e máquinas)</td><td>'+fm(d.integ)+'</td><td>–</td><td>'+fm(d.integ)+'</td></tr>':'')+
     '<tr class="ind"><td>Resultado líquido do exercício</td><td>–</td><td>'+fmc(d.ll)+'</td><td>'+fmc(d.ll)+'</td></tr>'+
     '<tr class="sub"><td>Saldos em 31/12/'+y+'</td><td>'+fm(d.cap_fim)+'</td><td>'+fmc(d.res_fim)+'</td><td>'+fmc(d.cap_fim+d.res_fim)+'</td></tr>';
   }).join('');
   return nota+'<div class="grid g23"><div class="card"><h3>Demonstração das Mutações do Patrimônio Líquido <span class="sub">'+yearLabel()+' · R$</span></h3>'+
     '<div class="tbl-scroll mt"><table class="ledger"><tr><th></th><th>Capital Social</th><th>Lucros/Prej. Acumulados</th><th>Total do PL</th></tr>'+blocks+'</table></div>'+
-    '<div class="section-note">Capital social integralizado na abertura (01/2021) em R$ 5.537.520,00. Sem distribuição de dividendos no período — resultados integralmente retidos.</div></div>'+
+    '<div class="section-note">Capital social de '+money(DATA.dmpl[YL].cap_fim)+' subscrito e integralizado na constituição (01/'+Y0+')'+(DATA.dmpl[Y0].integ?': '+money(DATA.dmpl[Y0].integ_caixa)+' em dinheiro e '+money(DATA.dmpl[Y0].integ_bens)+' em bens — parcela que não transita pela DFC (CPC 03, item 43)':'')+'. Sem distribuição de lucros no período — resultados integralmente mantidos em lucros ou prejuízos acumulados.</div></div>'+
     '<div class="card"><h3>Evolução do PL <span class="sub">fechamento anual</span></h3><div class="chartbox tall"><canvas id="ch-dmpl"></canvas></div></div></div>';
 }
 function postDMPL(){
@@ -958,8 +1079,8 @@ function dfcAgg(){
   if(!isAll()) return DATA.dfc[state.year];
   const o = {ent:sumYears(y=>DATA.dfc[y].ent), sai:sumYears(y=>DATA.dfc[y].sai), liq:sumYears(y=>DATA.dfc[y].liq),
     caixa_ini:DATA.dfc[Y0].caixa_ini, caixa_fim:DATA.dfc[YL].caixa_fim,
-    ind:{ll:sumYears(y=>DATA.dfc[y].ind.ll), dep:sumYears(y=>DATA.dfc[y].ind.dep), dwc:sumYears(y=>DATA.dfc[y].ind.dwc),
-      oper:sumYears(y=>DATA.dfc[y].ind.oper), invest:sumYears(y=>DATA.dfc[y].ind.invest), fin:sumYears(y=>DATA.dfc[y].ind.fin)}};
+    ind:{}};
+  Object.keys(DATA.dfc[Y0].ind).forEach(k=>{ o.ind[k] = sumYears(y=>DATA.dfc[y].ind[k]); });
   return o;
 }
 function dfcExtra(k){ return isAll() ? sumYears(y=>DATA.dfc[y].extra[k]) : DATA.dfc[state.year].extra[k]; }
@@ -986,40 +1107,53 @@ function stmtDFC(){
                   'Folha','Pagamento Folha','Fiscal','Pagamento Tributos','Abertura'];
   let outrosE = 0, outrosS = 0;
   Object.keys(M).forEach(n => { if(!MAPPED.includes(n)){ outrosE += M[n].e; outrosS += M[n].s; } });
-  const operDir = receb - forn - pessoal - trib + outrosE - outrosS;
-  const varTot = operDir + aporte;
+  /* capex liquidado via contas a pagar: reclassificado para atividades de investimento (CPC 03, item 16) */
+  const capexCx = -i.invest;
+  const fornOper = forn - capexCx;
+  const operDir = receb - fornOper - pessoal - trib + outrosE - outrosS;
+  const varTot = operDir - capexCx + aporte;
   const outrosRows =
     (Math.abs(outrosE)>0.005 ? '<tr class="ind"><td>(+) Outros recebimentos operacionais</td><td>'+fm(outrosE)+'</td></tr>' : '')+
     (Math.abs(outrosS)>0.005 ? '<tr class="ind"><td>(−) Outros pagamentos operacionais</td><td>'+fm(-outrosS)+'</td></tr>' : '');
   const direta = '<table class="ledger"><tr><th></th><th>'+yearLabel()+' · R$</th></tr>'+
     '<tr class="sec"><td colspan="2">Atividades operacionais</td></tr>'+
     '<tr class="ind"><td>(+) Recebimentos de clientes</td><td>'+fm(receb)+'</td></tr>'+
-    '<tr class="ind"><td>(−) Pagamentos a fornecedores — mercadorias, despesas e capex</td><td>'+fm(-forn)+'</td></tr>'+
+    '<tr class="ind"><td>(−) Pagamentos a fornecedores de mercadorias e serviços</td><td>'+fm(-fornOper)+'</td></tr>'+
     '<tr class="ind"><td>(−) Pagamentos de pessoal e encargos</td><td>'+fm(-pessoal)+'</td></tr>'+
     '<tr class="ind"><td>(−) Tributos pagos — ICMS, PIS, COFINS, IRPJ e CSLL</td><td>'+fm(-trib)+'</td></tr>'+
     outrosRows+
-    '<tr class="sub"><td>Caixa gerado (consumido) nas operações</td><td>'+fmc(operDir)+'</td></tr>'+
+    '<tr class="sub"><td>Caixa líquido das atividades operacionais</td><td>'+fmc(operDir)+'</td></tr>'+
+    '<tr class="sec"><td colspan="2">Atividades de investimento</td></tr>'+
+    '<tr class="ind"><td>(−) Aquisições de imobilizado e intangível</td><td>'+fmc(-capexCx)+'</td></tr>'+
     '<tr class="sec"><td colspan="2">Atividades de financiamento</td></tr>'+
-    '<tr class="ind"><td>Integralização de capital em espécie</td><td>'+fm(aporte)+'</td></tr>'+
+    '<tr class="ind"><td>Integralização de capital em dinheiro</td><td>'+fm(aporte)+'</td></tr>'+
     '<tr class="tot"><td>VARIAÇÃO LÍQUIDA DE CAIXA</td><td>'+fmc(varTot)+'</td></tr>'+
     '<tr class="ind"><td>Caixa no início do período</td><td>'+fm(d.caixa_ini)+'</td></tr>'+
     '<tr class="sub"><td>Caixa no fim do período</td><td>'+fm(d.caixa_fim)+'</td></tr>'+
     '</table>';
+  const wcRow = (lab, v) => Math.abs(v)>0.005 ? '<tr class="ind"><td>&nbsp;&nbsp;'+lab+'</td><td>'+fmc(v)+'</td></tr>' : '';
   const indireta = '<table class="ledger"><tr><th></th><th>'+yearLabel()+' · R$</th></tr>'+
     '<tr class="sec"><td colspan="2">Atividades operacionais</td></tr>'+
     '<tr class="ind"><td>Resultado líquido do exercício</td><td>'+fmc(i.ll)+'</td></tr>'+
     '<tr class="ind"><td>(+) Depreciação e amortização</td><td>'+fm(i.dep)+'</td></tr>'+
-    '<tr class="ind"><td>(±) Variação do capital de giro — clientes, estoques, tributos e fornecedores</td><td>'+fmc(i.dwc)+'</td></tr>'+
+    '<tr class="ind"><td>(±) Variação do capital de giro</td><td>'+fmc(i.dwc)+'</td></tr>'+
+    wcRow('(Aumento) redução de clientes', -i.dCli)+
+    wcRow('(Aumento) redução de estoques', -i.dEst)+
+    wcRow('(Aumento) redução de tributos a recuperar', -i.dRec)+
+    wcRow('Aumento (redução) de fornecedores', i.dForn)+
+    wcRow('Aumento (redução) de obrigações fiscais', i.dFisc)+
+    wcRow('Aumento (redução) de obrigações trabalhistas', i.dTrab)+
     '<tr class="sub"><td>Caixa líquido das atividades operacionais</td><td>'+fmc(i.oper)+'</td></tr>'+
     '<tr class="sec"><td colspan="2">Atividades de investimento</td></tr>'+
     '<tr class="ind"><td>Aquisições de imobilizado e intangível</td><td>'+fmc(i.invest)+'</td></tr>'+
     '<tr class="sec"><td colspan="2">Atividades de financiamento</td></tr>'+
-    '<tr class="ind"><td>Integralização de capital social</td><td>'+fmc(i.fin)+'</td></tr>'+
+    '<tr class="ind"><td>Integralização de capital em dinheiro</td><td>'+fmc(i.fin)+'</td></tr>'+
     '<tr class="tot"><td>VARIAÇÃO LÍQUIDA DE CAIXA</td><td>'+fmc(i.oper+i.invest+i.fin)+'</td></tr>'+
     '<tr class="sec"><td colspan="2">Divulgações complementares (CPC 03)</td></tr>'+
-    '<tr class="ind"><td>Juros pagos no período</td><td>'+fm(dfcExtra('juros_pagos'))+'</td></tr>'+
+    '<tr class="ind"><td>Juros e despesas bancárias pagos — classificados nas operações</td><td>'+fm(dfcExtra('juros_pagos'))+'</td></tr>'+
     '<tr class="ind"><td>Tributos sobre o lucro pagos (IRPJ/CSLL)</td><td>'+fm(dfcExtra('ir_pago'))+'</td></tr>'+
-    '<tr class="ind"><td>Tributos sobre consumo pagos (PIS/COFINS)</td><td>'+fm(dfcExtra('trib_pagos'))+'</td></tr>'+
+    '<tr class="ind"><td>Tributos sobre o consumo pagos (ICMS, PIS e COFINS)</td><td>'+fm(dfcExtra('trib_consumo'))+'</td></tr>'+
+    (i.naoCaixa>0.005?'<tr class="ind"><td>Transação sem efeito caixa — integralização de capital em estoques ('+compact(i.ncEst)+') e máquinas ('+compact(i.ncImob)+')</td><td>'+fm(i.naoCaixa)+'</td></tr>':'')+
     '<tr class="ind"><td>Caixa e equivalentes no início do período</td><td>'+fm(d.caixa_ini)+'</td></tr>'+
     '<tr class="sub"><td>Caixa e equivalentes no fim do período</td><td>'+fm(d.caixa_fim)+'</td></tr>'+
     '</table>';
@@ -1030,9 +1164,9 @@ function stmtDFC(){
     kpi('Caixa final', compact(d.caixa_fim), 'brass','Concilia com o Balanço ✓')+
     '</div><div class="grid g2 mt">'+
     '<div class="card"><h3>DFC — Método Direto <span class="sub">CPC 03 · fluxos por natureza</span></h3><div class="tbl-scroll mt">'+direta+'</div>'+
-    '<div class="section-note">Fluxos efetivos da conta Caixa e Bancos classificados pelo módulo de origem. Pagamentos a fornecedores incluem aquisições de imobilizado e intangível liquidadas via contas a pagar.</div></div>'+
+    '<div class="section-note">Fluxos efetivos da conta Caixa e Bancos classificados pelo módulo de origem. As aquisições de imobilizado e intangível pagas via contas a pagar ('+compact(capexCx)+') foram retiradas dos pagamentos a fornecedores e apresentadas nas atividades de investimento.</div></div>'+
     '<div class="card"><h3>DFC — Método Indireto <span class="sub">CPC 03 · reconciliação do resultado</span></h3><div class="tbl-scroll mt">'+indireta+'</div>'+
-    '<div class="section-note">Ambos os métodos convergem para a mesma variação de caixa: '+compact(d.caixa_fim - d.caixa_ini)+' no período — conciliada com o Balanço.</div></div></div>'+
+    '<div class="section-note">Variação do capital de giro apurada pelas contas do Balanço. Ambos os métodos convergem para o mesmo caixa operacional'+(Math.abs(operDir-i.oper)<0.5?' ✓':' (diferença de '+money(operDir-i.oper)+')')+' e para a mesma variação de caixa: '+compact(d.caixa_fim - d.caixa_ini)+' no período'+(Math.abs(i.oper+i.invest+i.fin-(d.caixa_fim-d.caixa_ini))<0.5?' — conciliada com o Balanço ✓':'')+'.</div></div></div>'+
     '<div class="card mt"><h3>Fluxo de caixa <span class="sub">'+(isAll()?'anual · método direto':'mensal · '+state.year)+'</span></h3>'+
     '<div class="chartbox tall"><canvas id="ch-dfc"></canvas></div></div>';
 }
@@ -1312,14 +1446,18 @@ function renderNotas(){
   const baseLR = tri.reduce((a,t)=>a+t.base,0);
   const cx = notasBal(COD.cx), cli = notasBal(COD.cli), est = notasBal(COD.est);
   const tribRec = notasBal('1.1.4.01')+notasBal(COD.pis_rec)+notasBal(COD.cof_rec);
-  const forn = -notasBal('2.1.01.001');
-  const obrigFisc = -bal.contas.filter(c=>c.cl==='Passivo'&&c.s==='Tributos').reduce((a,c)=>a+c.v,0);
-  const obrigTrab = -bal.contas.filter(c=>c.cl==='Passivo'&&c.s==='Trabalhista').reduce((a,c)=>a+c.v,0);
+  /* passivo: contas credoras com saldo positivo na base */
+  const forn = bal.contas.filter(c=>c.cl==='Passivo'&&c.s==='Fornecedores').reduce((a,c)=>a+c.v,0);
+  const obrigFisc = bal.contas.filter(c=>c.cl==='Passivo'&&c.s==='Fiscal').reduce((a,c)=>a+c.v,0);
+  const obrigTrab = bal.contas.filter(c=>c.cl==='Passivo'&&c.s==='Trabalhista').reduce((a,c)=>a+c.v,0);
+  const PZ = prazosBP(y);
   const D = DATA.imob, I = DATA.intang;
-  const imobCusto = D.ativos.reduce((a,x)=>a+x.v,0);
-  const imobDep = Object.values(D[y].acum).reduce((a,v)=>a+v,0);
-  const intCusto = I.ativos.reduce((a,x)=>a+x.v,0);
-  const intAm = Object.values(I[y].acum).reduce((a,v)=>a+v,0);
+  const fimY = y+'-12-31';
+  const imobAt = D.ativos.filter(x=>x.dt<=fimY), intAt = I.ativos.filter(x=>x.dt<=fimY);
+  const imobCusto = imobAt.reduce((a,x)=>a+x.v,0);
+  const imobDep = imobAt.reduce((a,x)=>a+(D[y].acum[x.id]||0),0);
+  const intCusto = intAt.reduce((a,x)=>a+x.v,0);
+  const intAm = intAt.reduce((a,x)=>a+(I[y].acum[x.id]||0),0);
   const folha = DATA.folha[y];
   const cr = DATA.cr, cp = DATA.cp;
   const pos = DATA.estoque.pos;
@@ -1338,9 +1476,12 @@ function renderNotas(){
 
   /* --- Provisão de férias, 13º e encargos (estimativa gerencial) --- */
   const bruto = folha.bruto_ult * lastM(y);   /* proxy de base anual pela folha */
-  const provFerias = folha.bruto_ult * (1/12 + 1/3/12) * (1 + folha.enc_rate);
-  const prov13 = folha.bruto_ult * (1/12) * (1 + folha.enc_rate);
-  const provTot = provFerias + prov13;
+  /* a folha do modelo não registra 13º nem o 1/3 de férias (12 competências uniformes) */
+  const encF = 1 + folha.enc_rate;
+  const desp13 = folha.bruto_ult * encF;                       /* 13º anual: 1 salário + encargos */
+  const despTerco = folha.bruto_ult / 3 * encF;                /* adicional constitucional de férias */
+  const provFerias = folha.bruto_ult * (4/3) * (6/12) * encF;  /* saldo em 31/12: média de 6/12 avos adquiridos */
+  const provTot = provFerias;
 
   const plNeg = (dmpl.cap_fim + dmpl.res_fim) < 0;
   const llNeg = dre.Lucro_Liquido < 0;
@@ -1359,43 +1500,48 @@ function renderNotas(){
   b.push(notaBlock(4,'Caixa e equivalentes de caixa',
     '<p>Numerário e disponibilidades de livre movimentação: <b style="color:var(--text)">'+money(cx)+'</b> em '+dataBase+'. O saldo concilia com o razão da conta '+COD.cx+' — vide módulo Conciliação Bancária. '+(cx<0?'<b style="color:var(--neg)">O saldo apresenta-se negativo na base de origem</b>, situação sem respaldo contábil para uma conta de disponibilidades (não há cheque especial registrado como passivo); trata-se de inconsistência da base de dados — vide Nota 18.':'')+'</p>'));
   b.push(notaBlock(5,'Contas a receber de clientes e perdas esperadas (PECLD)',
-    '<p>Saldo de <b style="color:var(--text)">'+money(cli)+'</b> em '+dataBase+', de vendas a prazo, com prazo médio de recebimento (PMR) de '+cr[y].pmr.toLocaleString('pt-BR',{maximumFractionDigits:0})+' dias. A composição por vencimento dos títulos em aberto na data-base e a perda esperada estimada pela matriz de provisionamento (CPC 48) são:</p>'+
+    '<p>Saldo de <b style="color:var(--text)">'+money(cli)+'</b> em '+dataBase+', de vendas a prazo, equivalente a um prazo médio de recebimento (PMR) de '+PZ.pmr.toLocaleString('pt-BR',{maximumFractionDigits:0})+' dias sobre a receita bruta do exercício. A composição por vencimento disponível no razão auxiliar refere-se à carteira de 31/12/'+YL+' e a perda esperada estimada pela matriz de provisionamento (CPC 48) é:</p>'+
     miniTbl(['Faixa de vencimento','Em aberto R$','% perda','Perda esperada R$'],
       pecldRows.map(r=>'<tr><td>'+r.n+'</td><td>'+fm(r.v)+'</td><td style="color:var(--dim)">'+pct(r.r)+'</td><td>'+fm(r.perda)+'</td></tr>').join('')+
       '<tr class="tot"><td>Total</td><td>'+fm(crAberto)+'</td><td></td><td>'+fm(pecldTot)+'</td></tr>')+
-    '<p style="margin-top:8px">A carteira em aberto totaliza '+money(crAberto)+'. A perda esperada estimada é de <b style="color:var(--text)">'+money(pecldTot)+'</b> ('+pct(pecldTot/(crAberto||1))+' da carteira). Trata-se de <b style="color:var(--text)">estimativa gerencial</b> apresentada para fins de análise — o modelo de origem não constitui a PECLD nos saldos contábeis; sua adoção reduziria o resultado e o ativo no montante indicado.</p>'));
+    '<p style="margin-top:8px">A carteira em aberto no razão auxiliar totaliza '+money(crAberto)+'. A perda esperada estimada é de <b style="color:var(--text)">'+money(pecldTot)+'</b> ('+pct(pecldTot/(crAberto||1))+' da carteira). Trata-se de <b style="color:var(--text)">estimativa gerencial</b> apresentada para fins de análise — o modelo de origem não constitui a PECLD nos saldos contábeis; sua adoção reduziria o resultado e o ativo no montante indicado. '+
+    (Math.abs(BPV(YL,COD.cli)-crAberto)>1?'<b style="color:var(--text)">Conciliação</b> — a carteira do razão auxiliar ('+money(crAberto)+') não concilia com o saldo contábil de Clientes em 31/12/'+YL+' ('+money(BPV(YL,COD.cli))+'); a diferença de '+money(BPV(YL,COD.cli)-crAberto)+' corresponde a títulos que o auxiliar considera liquidados e que permanecem em aberto no Razão — vide Nota 18.':'')+'</p>'));
   b.push(notaBlock(6,'Estoques',
     '<p>Mercadorias para revenda avaliadas ao custo médio ponderado: <b style="color:var(--text)">'+money(est)+'</b> em '+dataBase+'.'+(est<0?' <b style="color:var(--neg)">O saldo apresenta-se negativo na base de origem</b> — situação impossível para estoque físico, decorrente de saídas registradas acima das entradas acumuladas; inconsistência reportada na Nota 18.':' A posição física compreende '+nf0.format(estQ)+' unidades em '+pos.length+' itens.')+' Não há estoques dados em garantia.</p>'));
   b.push(notaBlock(7,'Tributos a recuperar',
     '<p>Créditos de ICMS, PIS e COFINS não cumulativos sobre aquisições: <b style="color:var(--text)">'+money(tribRec)+'</b> em '+dataBase+', compensáveis com débitos próprios das saídas subsequentes — vide memória de apuração no módulo Impostos.</p>'));
   b.push(notaBlock(8,'Imobilizado e teste de recuperabilidade (impairment)',
     '<p>Custo de <b style="color:var(--text)">'+money(imobCusto)+'</b> e depreciação acumulada de <b style="color:var(--text)">'+money(imobDep)+'</b> em '+dataBase+' ('+D.ativos.length+' ativos). Depreciação do exercício: '+money(D[y].dep_ano)+', linear. O mapa de mutação está no módulo Controle de Imobilizado. '+
-    '<b style="color:var(--text)">Impairment (CPC 01)</b> — '+(plNeg||llNeg?'a recorrência de prejuízos e o patrimônio líquido negativo constituem indicadores de perda de valor recuperável que exigiriam ':'não há indicadores relevantes de perda de valor recuperável no período; ainda assim, recomenda-se avaliação periódica com ')+'teste formal de recuperabilidade dos ativos de longa duração, comparando o valor contábil ao maior entre o valor em uso e o valor justo líquido de despesas de venda. O modelo não registra provisão para impairment.</p>'));
+    '<b style="color:var(--text)">Impairment (CPC 01)</b> — '+(plNeg||llNeg?(plNeg?'os prejuízos e o patrimônio líquido negativo':'o prejuízo do exercício')+' constitu'+(plNeg?'em':'i')+' indicador'+(plNeg?'es':'')+' de possível perda de valor recuperável que exige ':'não há indicadores relevantes de perda de valor recuperável no período; ainda assim, recomenda-se avaliação periódica com ')+'teste formal de recuperabilidade dos ativos de longa duração, comparando o valor contábil ao maior entre o valor em uso e o valor justo líquido de despesas de venda. O modelo não registra provisão para impairment.</p>'));
   b.push(notaBlock(9,'Intangível',
     '<p>Licenças de software e ativos de tecnologia ao custo de <b style="color:var(--text)">'+money(intCusto)+'</b>, com amortização acumulada de <b style="color:var(--text)">'+money(intAm)+'</b> em '+dataBase+' ('+I.ativos.length+' ativos). Amortização do exercício: '+money(I[y].am_ano)+'. Vidas úteis entre 48 e 60 meses; aplicam-se as mesmas considerações de impairment da Nota 8.</p>'));
   b.push(notaBlock(10,'Fornecedores',
-    '<p>Obrigações com fornecedores de mercadorias e serviços: <b style="color:var(--text)">'+money(forn)+'</b> em '+dataBase+'. Prazo médio de pagamento (PMP) de '+cp[y].pmp.toLocaleString('pt-BR',{maximumFractionDigits:0})+' dias, sem risco sacado.</p>'));
+    '<p>Obrigações com fornecedores de mercadorias e serviços: <b style="color:var(--text)">'+money(forn)+'</b> em '+dataBase+', equivalente a um prazo médio de pagamento (PMP) de '+PZ.pmp.toLocaleString('pt-BR',{maximumFractionDigits:0})+' dias sobre as compras a prazo do exercício, sem operações de risco sacado. '+
+    (Math.abs(BPV(YL,'2.1.1.01')-DATA.cp.aberto_total)>1&&y===YL?'O razão auxiliar de contas a pagar indica '+money(DATA.cp.aberto_total)+' em aberto, valor que não concilia com a conta controle — vide Nota 18.':'')+'</p>'));
   b.push(notaBlock(11,'Obrigações fiscais e trabalhistas — provisões de férias e 13º',
-    '<p>Tributos a recolher de <b style="color:var(--text)">'+money(obrigFisc)+'</b> (IRPJ, CSLL, PIS e COFINS apurados e não liquidados) e obrigações trabalhistas de <b style="color:var(--text)">'+money(obrigTrab)+'</b> em '+dataBase+'. '+
-    '<b style="color:var(--text)">Provisão de férias e 13º salário</b> — o modelo de origem liquida a folha na competência e não constitui provisões trabalhistas. Pelo regime de competência (CPC 25), estima-se um passivo adicional de <b style="color:var(--text)">'+money(provTot)+'</b> ('+money(provFerias)+' de férias + 1/3 e '+money(prov13)+' de 13º proporcional, encargos de '+pct(folha.enc_rate)+' incluídos), calculado sobre a folha do último mês. Estimativa gerencial não refletida nos saldos contábeis; sua adoção elevaria o passivo circulante e reduziria o resultado no montante indicado.</p>'));
+    '<p>Tributos a recolher de <b style="color:var(--text)">'+money(obrigFisc)+'</b> (ICMS, PIS, COFINS, IRPJ e CSLL apurados e não liquidados) e obrigações trabalhistas de <b style="color:var(--text)">'+money(obrigTrab)+'</b> em '+dataBase+'. '+
+    '<b style="color:var(--text)">Provisão de férias e 13º salário</b> — a folha do modelo de origem registra doze competências uniformes, sem 13º salário, sem o adicional de 1/3 de férias e sem provisões trabalhistas. Pelo regime de competência (CPC 00 e CPC 25), o resultado do exercício deveria absorver cerca de <b style="color:var(--text)">'+money(desp13+despTerco)+'</b> adicionais ('+money(desp13)+' de 13º e '+money(despTerco)+' de 1/3 de férias, com encargos de '+pct(folha.enc_rate)+'). Em '+dataBase+' o 13º já estaria liquidado (prazo legal até 20/12), mas permaneceria uma provisão de férias + 1/3 estimada em <b style="color:var(--text)">'+money(provTot)+'</b>, considerando em média 6/12 avos adquiridos por colaborador sobre a folha do último mês. Estimativas gerenciais não refletidas nos saldos contábeis.</p>'));
   b.push(notaBlock(12,'Empréstimos, financiamentos e arrendamentos',
     '<p>A entidade não possui empréstimos ou financiamentos contratados — a estrutura de capital de terceiros resume-se a fornecedores e obrigações fiscais/trabalhistas. '+
     '<b style="color:var(--text)">Arrendamentos (CPC 06-R2)</b> — há despesa recorrente de aluguel e ocupação. Caso os contratos de locação superem 12 meses e não se qualifiquem como de baixo valor, o CPC 06-R2 exigiria o reconhecimento de um ativo de direito de uso e do passivo de arrendamento correspondente, com efeitos sobre imobilizado, endividamento e EBITDA. O modelo trata o aluguel como despesa linear (prática do CPC 06 anterior); recomenda-se levantamento dos contratos para mensuração do direito de uso.</p>'));
   b.push(notaBlock(13,'Patrimônio líquido e destinação do resultado',
-    '<p>Capital social subscrito e integralizado de <b style="color:var(--text)">'+money(dmpl.cap_fim)+'</b>, sem alterações no período. Prejuízos acumulados de <b style="color:var(--text)">'+money(dmpl.res_fim)+'</b> em '+dataBase+', resultando em patrimônio líquido '+(dmpl.cap_fim+dmpl.res_fim<0?'<b style="color:var(--neg)">negativo</b> de '+money(dmpl.cap_fim+dmpl.res_fim):'de '+money(dmpl.cap_fim+dmpl.res_fim))+'. '+
+    '<p>Capital social subscrito e integralizado de <b style="color:var(--text)">'+money(dmpl.cap_fim)+'</b>, integralizado na constituição e sem alterações posteriores. '+(dmpl.res_fim<0?'Prejuízos':'Lucros')+' acumulados de <b style="color:var(--text)">'+money(Math.abs(dmpl.res_fim))+'</b> em '+dataBase+', resultando em patrimônio líquido '+(dmpl.cap_fim+dmpl.res_fim<0?'<b style="color:var(--neg)">negativo</b> de '+money(dmpl.cap_fim+dmpl.res_fim):'de '+money(dmpl.cap_fim+dmpl.res_fim))+'. '+
     '<b style="color:var(--text)">Destinação do resultado</b> — não houve distribuição de lucros no período; o resultado do exercício foi '+(prejAcum?'transferido para a conta de resultados acumulados, que ainda apresenta saldo negativo — enquanto persistir prejuízo acumulado não há base para distribuição':'integralmente retido na conta de resultados acumulados')+'. Sendo sociedade limitada, não se aplica a constituição obrigatória de reserva legal prevista para as sociedades por ações.</p>'));
   b.push(notaBlock(14,'Receita operacional líquida',
-    '<p>Receita bruta de '+money(dre.Receita_Bruta)+' no exercício, deduzida de '+money(dre.Deducoes)+' de PIS e COFINS, resultando em receita líquida de <b style="color:var(--text)">'+money(dre.Receita_Liquida)+'</b>. O detalhamento mensal está na DRE com drill por competência.</p>'));
+    '<p>Receita bruta de '+money(dre.Receita_Bruta)+' no exercício, deduzida de '+money(Math.abs(dre.Deducoes))+' de ICMS, PIS e COFINS incidentes sobre as vendas, resultando em receita líquida de <b style="color:var(--text)">'+money(dre.Receita_Liquida)+'</b>. O detalhamento mensal está na DRE com drill por competência.</p>'));
   b.push(notaBlock(15,'Imposto de renda, contribuição social e prejuízos fiscais',
-    '<p>Apuração pelo Lucro Real trimestral: LAIR de '+money(dre.LAIR)+', com base tributável (soma das bases trimestrais positivas) de <b style="color:var(--text)">'+money(baseLR)+'</b>, IRPJ de '+money(irpj)+' e CSLL de '+money(csll)+'. '+
+    '<p>Apuração pelo Lucro Real trimestral: LAIR '+(dre.LAIR<0?'negativo de '+money(-dre.LAIR):'de '+money(dre.LAIR))+' no exercício, com base tributável (soma das bases trimestrais positivas) de <b style="color:var(--text)">'+money(baseLR)+'</b>, IRPJ de '+money(irpj)+' e CSLL de '+money(csll)+'. '+
     '<b style="color:var(--text)">Prejuízos fiscais (IR diferido, CPC 32)</b> — '+(lal.saldo_prej_fim>1?'a entidade mantém saldo de prejuízo fiscal a compensar de <b style="color:var(--text)">'+money(lal.saldo_prej_fim)+'</b> na Parte B do LALUR, compensável em exercícios futuros à razão de até 30% do lucro real de cada período (trava dos 30%). Dado o histórico de lucros tributáveis, um ativo fiscal diferido poderia ser reconhecido na medida em que sua realização seja provável (CPC 32); o modelo não o registra.':'a entidade não possui saldo relevante de prejuízo fiscal a compensar ao fim do período — as bases trimestrais positivas foram tributadas no próprio exercício.')+' A demonstração completa está no módulo Impostos.</p>'));
   b.push(notaBlock(16,'Gestão de riscos financeiros',
-    '<p>(CPC 40) <b style="color:var(--text)">Risco de crédito</b> — concentração relevante em poucos clientes; o maior representa parcela significativa do faturamento, mitigada por acompanhamento do aging (Nota 5). <b style="color:var(--text)">Risco de liquidez</b> — é o risco preponderante: geração de caixa historicamente insuficiente para cobrir a estrutura de custos, com forte dependência do alongamento de fornecedores. <b style="color:var(--text)">Risco de mercado</b> — exposição a variações de preço de compra das mercadorias; não há exposição a moeda estrangeira nem a instrumentos financeiros derivativos.</p>'));
+    '<p>(CPC 40) <b style="color:var(--text)">Risco de crédito</b> — concentração relevante em poucos clientes; o maior representa parcela significativa do faturamento, mitigada por acompanhamento do aging (Nota 5). <b style="color:var(--text)">Risco de liquidez</b> — é o risco preponderante: a geração de caixa operacional ('+money(DATA.dfc[y].ind.oper)+' no exercício) depende do alongamento de fornecedores (PMP de '+PZ.pmp.toFixed(0)+' dias), enquanto o recebimento de clientes se alonga (PMR de '+PZ.pmr.toFixed(0)+' dias). <b style="color:var(--text)">Risco de mercado</b> — exposição a variações de preço de compra das mercadorias; não há exposição a moeda estrangeira nem a instrumentos financeiros derivativos.</p>'));
   b.push(notaBlock(17,'Continuidade operacional',
     '<p>'+(plNeg?'O patrimônio líquido negativo e os prejuízos recorrentes indicam incerteza relevante sobre a continuidade (CPC 26). A manutenção das operações depende de aporte de capital pelos sócios e/ou da recuperação da rentabilidade.':'Não foram identificadas incertezas relevantes quanto à capacidade de continuidade operacional (CPC 26): a entidade mantém patrimônio líquido positivo e geração de caixa compatível com suas obrigações.')+' As demonstrações foram preparadas no pressuposto de continuidade das operações.</p>'));
   const cxNeg = YEARS.some(yy => (DATA.bp_saldos_m[yy][COD.cx]||[]).some(v => v!==null && v<0));
   const estNeg = YEARS.some(yy => (DATA.bp_saldos_m[yy][COD.est]||[]).some(v => v!==null && v<0));
   const temAnomalia = cxNeg || estNeg;
+  const difAux = [];
+  if(Math.abs(BPV(YL,COD.cli) - DATA.cr.aberto_total) > 1) difAux.push('contas a receber (auxiliar '+money(DATA.cr.aberto_total)+' × contábil '+money(BPV(YL,COD.cli))+')');
+  if(Math.abs(BPV(YL,'2.1.1.01') - DATA.cp.aberto_total) > 1) difAux.push('contas a pagar (auxiliar '+money(DATA.cp.aberto_total)+' × contábil '+money(BPV(YL,'2.1.1.01'))+')');
   b.push(notaBlock(18,'Nota sobre a qualidade dos dados de origem',
     '<p>Esta é uma <b style="color:var(--text)">base de dados fictícia para fins de demonstração</b>. '+
     (temAnomalia
@@ -1404,7 +1550,8 @@ function renderNotas(){
         (cxNeg&&estNeg?' e ':'')+
         (estNeg?'o saldo de <b style="color:var(--text)">Estoques</b> apresenta-se negativo em parte do período':'')+
         ', situações sem respaldo contábil. Os valores são apresentados exatamente como constam da base, sem ajustes, preservando a rastreabilidade com o Razão. Em um fechamento real, tais saldos exigiriam investigação e reclassificação antes da emissão.'
-      : 'A verificação de integridade não apontou inconsistências relevantes: o Razão está balanceado (Σ débitos = Σ créditos), o Balanço fecha em todos os exercícios (Ativo = Passivo + PL), e os saldos de disponibilidades e estoques permanecem positivos ao longo de todo o horizonte. Os cronogramas de depreciação e amortização conciliam com os saldos do balancete.')+
+      : 'A verificação de integridade não apontou inconsistências nas demonstrações: o Razão está balanceado (Σ débitos = Σ créditos), o Balanço fecha em todos os exercícios (Ativo = Passivo + PL), e os saldos de disponibilidades e estoques permanecem positivos ao longo de todo o horizonte. Os cronogramas de depreciação e amortização conciliam com os saldos do balancete.')+
+    (difAux.length ? ' <b style="color:var(--text)">Ponto de atenção</b> — os razões auxiliares de '+difAux.join(' e ')+' não conciliam com as respectivas contas controle em 31/12/'+YL+': o auxiliar trata como liquidados títulos que permanecem em aberto no Razão. As demonstrações e os indicadores de prazo médio seguem os saldos contábeis; os módulos operacionais de Clientes e Fornecedores exibem a visão do auxiliar com a conciliação indicada.' : '')+
     '</p>'));
 
   return '<div class="card"><h3>Notas Explicativas às Demonstrações Financeiras <span class="sub">exercício encerrado em '+dataBase+' · valores em R$</span></h3>'+
@@ -1429,7 +1576,8 @@ function indCalc(y){
   const depam = DATA.despesas_sub[y].filter(d=>['Depreciação','Amortização'].includes(d.n)).reduce((a,d)=>a+d.v,0);
   const EBITDA = EBIT + depam;
   const giroEst = DATA.estoque[y].giro;
-  const pmr = DATA.cr[y].pmr, pmp = DATA.cp[y].pmp;
+  /* prazos pelos saldos do Balanço — o razão auxiliar de CR/CP não concilia com as contas controle */
+  const {pmr, pmp} = prazosBP(y);
   const pme = 360/giroEst;
   return {
     /* liquidez */
@@ -1488,9 +1636,9 @@ function renderInd(){
       ['ROE — retorno sobre o PL','LL / PL', I2=>pct(I2.roe), I2=>I2.roe>0],
       ['Giro do ativo','RL / Ativo total', I2=>fx(I2.giroAtivo), I2=>I2.giroAtivo>.5]]],
     ['Atividade — prazos e ciclos',[
-      ['PMR — prazo médio de recebimento','Contas a receber', I2=>fxd(I2.pmr), I2=>I2.pmr<60],
+      ['PMR — prazo médio de recebimento','Clientes / receita bruta × 360', I2=>fxd(I2.pmr), I2=>I2.pmr<60],
       ['PME — prazo médio de estocagem','360 / giro do estoque', I2=>fxd(I2.pme), I2=>I2.pme<220],
-      ['PMP — prazo médio de pagamento','Contas a pagar', I2=>fxd(I2.pmp), ()=>true],
+      ['PMP — prazo médio de pagamento','Fornecedores / compras a prazo × 360', I2=>fxd(I2.pmp), I2=>I2.pmp<=180],
       ['Giro do estoque','CMV / estoque médio', I2=>fx(I2.giroEst)+'×', I2=>I2.giroEst>1.5],
       ['Ciclo operacional','PMR + PME', I2=>fxd(I2.cicloOp), I2=>I2.cicloOp<280],
       ['Ciclo financeiro','Ciclo operacional − PMP', I2=>fxd(I2.cicloFin), I2=>I2.cicloFin<220]]]
@@ -1525,7 +1673,7 @@ function renderInd(){
   return nota5 + kpis + dupont + charts +
     '<div class="card mt"><h3>Quadro de indicadores <span class="sub">'+(isAll()?'comparativo '+Y0+'–'+YL+'':y)+'</span></h3>'+
     '<div class="mt tbl-scroll">'+table+'</div>'+
-    '<div class="section-note">Valores em verde atendem aos parâmetros usuais de referência; em vermelho, pontos de atenção. Liquidez geral igual à corrente e composição do endividamento em 100% porque o modelo não possui passivo não circulante. PME apurado sobre o giro anual do estoque (base 360 dias).</div></div>';
+    '<div class="section-note">Valores em verde atendem aos parâmetros usuais de referência; em vermelho, pontos de atenção. Liquidez geral igual à corrente e composição do endividamento em 100% porque o modelo não possui passivo não circulante. PMR e PMP calculados pelos saldos de 31/12 das contas Clientes e Fornecedores (base 360 dias; compras a prazo = créditos lançados em Fornecedores no ano); PME pelo giro anual do estoque.</div></div>';
 }
 function postInd(){
   const pcOpt = {...ttip, callbacks:{label:c=>' '+c.dataset.label+': '+c.parsed.y.toLocaleString('pt-BR',{maximumFractionDigits:1})+(c.dataset.yAxisID==='yd'?' dias':'%')}};
@@ -1560,10 +1708,12 @@ function ctrlCalc(y){
   const dre = DATA.dre[y].annual;
   const sub = Object.fromEntries(DATA.despesas_sub[y].map(d=>[d.n,d.v]));
   const RL = dre.Receita_Liquida, LL = dre.Lucro_Liquido;
-  const varTot = dre.CMV_Custos + (sub['Logística']||0) + (sub['Comercial']||0);
-  const fixTot = dre.Despesas_Operacionais - (sub['Logística']||0) - (sub['Comercial']||0) + Math.abs(dre.Resultado_Financeiro);
+  /* custos em valor absoluto: na DRE os custos e despesas estão com sinal negativo; no quadro de natureza, positivos */
+  const semiVar = (sub['Logística']||0) + (sub['Comercial']||0);
+  const varTot = Math.abs(dre.CMV_Custos) + semiVar;
+  const fixTot = Math.abs(dre.Despesas_Operacionais) - semiVar - dre.Resultado_Financeiro;
   const MC = RL - varTot, mcPct = MC/RL;
-  const pe = fixTot/mcPct;                       /* ponto de equilíbrio contábil (em RL) */
+  const pe = mcPct>0 ? fixTot/mcPct : Infinity;  /* ponto de equilíbrio contábil (em RL) */
   const ms = (RL-pe)/RL;                          /* margem de segurança */
   const depam = (sub['Depreciação']||0)+(sub['Amortização']||0);
   const EBITDA = (dre.LAIR - dre.Resultado_Financeiro) + depam;
@@ -1645,15 +1795,21 @@ function ctrlNotas(y){
     : 'O resultado permanece sensível ao volume: com margem de contribuição de '+pct(K.mcPct)+', pequenas oscilações de receita têm efeito amplificado no lucro.'));
   /* 2 — ponto de equilíbrio */
   obs.push('O ponto de equilíbrio contábil está em '+b(compact(K.pe))+' de receita anual. '+(K.ms>=0
-    ? 'A margem de segurança é de apenas '+b(pct(K.ms))+' — a operação trabalha muito próxima do breakeven; qualquer choque de demanda leva o resultado a campo negativo.'
+    ? (K.ms<0.10
+      ? 'A margem de segurança é de apenas '+b(pct(K.ms))+' — a operação trabalha muito próxima do breakeven; qualquer choque de demanda leva o resultado a campo negativo.'
+      : 'A margem de segurança é de '+b(pct(K.ms))+' — a receita pode recuar nessa proporção antes de o resultado operacional ficar negativo.')
     : 'A receita atual está '+b(pct(Math.abs(K.ms)))+' ABAIXO do equilíbrio — a operação queima margem: é preciso recompor volume/preço ou reduzir a estrutura fixa.'));
   /* 3 — capital de giro e estoque */
-  obs.push('A NCG de '+b(compact(K.NCG))+' consome quase todo o CCL de '+b(compact(K.CCL))+', deixando tesouraria de '+b(compact(K.T))+'. O vilão é o ciclo: estoque gira apenas '+b(K.giroEst.toLocaleString('pt-BR',{maximumFractionDigits:2})+'×/ano')+' (PME de '+b(K.pme.toFixed(0)+' dias')+') e o PMR de '+K.pmr.toFixed(0)+' dias contra PMP de '+K.pmp.toFixed(0)+' dias gera ciclo financeiro de '+b(K.cicloFin.toFixed(0)+' dias')+' — a empresa financia clientes e estoque com capital próprio por quase '+Math.round(K.cicloFin/30)+' meses.');
+  obs.push('A NCG de '+b(compact(K.NCG))+' absorve '+b(pct(K.CCL>0?K.NCG/K.CCL:0))+' do CCL de '+b(compact(K.CCL))+', deixando tesouraria de '+b(compact(K.T))+'. O estoque gira '+b(K.giroEst.toLocaleString('pt-BR',{maximumFractionDigits:2})+'×/ano')+' (PME de '+b(K.pme.toFixed(0)+' dias')+'), o PMR é de '+K.pmr.toFixed(0)+' dias e o PMP de '+K.pmp.toFixed(0)+' dias, resultando em ciclo financeiro de '+b(K.cicloFin.toFixed(0)+' dias')+
+    (K.cicloFin>0
+      ? ' — a empresa financia clientes e estoque com recursos próprios por cerca de '+Math.max(1,Math.round(K.cicloFin/30))+' '+(Math.round(K.cicloFin/30)>1?'meses':'mês')+'.'
+      : ' — os prazos obtidos de fornecedores cobrem todo o ciclo operacional, uma dependência de crédito comercial que precisa ser monitorada.')+
+    (K.pmr>90?' O PMR elevado, com saldo de clientes crescente no Balanço, pede revisão da política de crédito e cobrança.':''));
   /* 4 — folha e produtividade */
   const g25folha = K25.folha/K21.folha-1, g25rec = K25.RL/K21.RL-1;
   obs.push('A folha consome '+b(pct(K.folhaRL))+' da receita ('+compact(K.folha)+' para '+K.hc+' colaboradores). No horizonte '+Y0+'→'+YL+' o custo de pessoal cresceu '+b(pct(g25folha))+' enquanto a receita variou '+b((g25rec>=0?'+':'')+pct(g25rec))+' — a produtividade (receita por colaborador) está sendo corroída pelos dissídios sem ganho de volume.');
   /* 5 — concentração e caixa */
-  obs.push('Concentração comercial: o maior cliente ('+esc(topCli.n)+') responde por '+b(pct(cliShare))+' do faturamento de '+y+'. A geração de caixa operacional de '+b(compact(K.oper))+' segue positiva'+(K.oper>0&&K.LL<0?' mesmo com prejuízo contábil — sustentada por depreciação e alongamento de fornecedores, o que não é sustentável indefinidamente.':'.'));
+  obs.push('Concentração comercial: o maior cliente ('+esc(topCli.n)+') responde por '+b(pct(cliShare))+' do faturamento de '+y+'. A geração de caixa operacional de '+b(compact(K.oper))+(K.oper>=0?' segue positiva':' é negativa')+(K.oper>0&&K.LL<0?' mesmo com prejuízo contábil — sustentada pela depreciação (despesa sem saída de caixa) e pelo alongamento de fornecedores, o que não é sustentável indefinidamente.':'.'));
   const numbered = obs.map((o,i)=>'<p style="margin:10px 0;line-height:1.7"><span style="font-family:var(--mono);color:var(--brass);font-weight:600">'+String(i+1).padStart(2,'0')+'</span> · '+o+'</p>').join('');
   /* plano de ação — regras sobre os dados */
   const acoes = [];
@@ -1669,7 +1825,7 @@ function ctrlNotas(y){
   return '<div class="grid g2 mt">'+
     '<div class="card"><h3>Notas de entendimento <span class="sub">diagnóstico do controller · '+y+'</span></h3><div class="mt" style="font-size:12.5px;color:var(--muted)">'+numbered+'</div></div>'+
     '<div class="card"><h3>Plano de ação recomendado <span class="sub">alavancas de melhoria priorizadas</span></h3>'+
-    '<div class="mt tbl-scroll"><table class="data"><tr><th>Ação</th><th>Como</th><th>Impacto estimado</th><th>Prioridade</th></tr>'+acRows+'</table></div>'+
+    '<div class="mt tbl-scroll"><table class="data acoes"><tr><th>Ação</th><th>Como</th><th>Impacto estimado</th><th>Prioridade</th></tr>'+acRows+'</table></div>'+
     '<div class="section-note">Ações geradas a partir dos próprios dados do período (gatilhos: giro de estoque, margem de segurança, peso dos fixos, ciclo financeiro e produtividade). Impactos são ordens de grandeza para priorização — detalhar em business case antes de executar.</div></div></div>';
 }
 function postCtrl(){
@@ -1679,10 +1835,11 @@ function postCtrl(){
   /* ponte do resultado (waterfall com barras flutuantes) */
   const steps = [
     ['Receita Líquida', dre.Receita_Liquida, 'base'],
-    ['(−) CMV', -dre.CMV_Custos, 'neg'],
-    ['(−) Despesas Op.', -dre.Despesas_Operacionais, 'neg'],
+    /* custos e despesas já vêm negativos da DRE: cada degrau reduz o acumulado */
+    ['(−) CMV', dre.CMV_Custos, 'neg'],
+    ['(−) Despesas Op.', dre.Despesas_Operacionais, 'neg'],
     ['(±) Financeiro', dre.Resultado_Financeiro, dre.Resultado_Financeiro>=0?'pos':'neg'],
-    ['(−) IRPJ/CSLL', -dre.IRPJ_CSLL, 'neg'],
+    ['(−) IRPJ/CSLL', dre.IRPJ_CSLL, 'neg'],
     ['Resultado', dre.Lucro_Liquido, dre.Lucro_Liquido>=0?'pos':'negT']
   ];
   let run = 0; const bars = [], cols = [];
@@ -2119,7 +2276,7 @@ function concilAgg(){
   const mod = {};
   YEARS.forEach(y=>DATA.concil[y].mod.forEach(m=>{ mod[m.n]=mod[m.n]||{e:0,s:0}; mod[m.n].e+=m.e; mod[m.n].s+=m.s; }));
   return {tot_e:sumYears(y=>DATA.concil[y].tot_e), tot_s:sumYears(y=>DATA.concil[y].tot_s),
-    nlanc:sumYears(y=>DATA.concil[y].nlanc), saldoFim:DATA.concil[2025].saldo[11],
+    nlanc:sumYears(y=>DATA.concil[y].nlanc), saldoFim:DATA.concil[YL].saldo[11],
     mod:Object.entries(mod).map(([n,v])=>({n,e:v.e,s:v.s}))};
 }
 function renderConcil(){
@@ -2225,9 +2382,12 @@ function arApAgg(key){
 }
 function agingCard(key, titulo){
   const ag = DATA[key].aging, tot = ag.reduce((a,b)=>a+b.v,0);
-  return '<div class="card"><h3>Aging dos títulos em aberto <span class="sub">posição 31/12/2025</span></h3>'+
+  const contab = key==='cr' ? BPV(YL,COD.cli) : BPV(YL,'2.1.1.01');
+  const dif = contab - tot;
+  return '<div class="card"><h3>Aging dos títulos em aberto <span class="sub">posição 31/12/'+YL+'</span></h3>'+
     '<div class="chartbox"><canvas id="ch-aging"></canvas></div>'+
-    '<div class="section-note">'+titulo+' em aberto: '+compact(tot)+' · faixas por dias de atraso sobre o vencimento.</div></div>';
+    '<div class="section-note">'+titulo+' em aberto no razão auxiliar: '+compact(tot)+' · faixas por dias de atraso sobre o vencimento.'+
+    (Math.abs(dif)>1?' <b style="color:var(--neg)">Conciliação pendente</b> — o saldo contábil da conta controle em 31/12/'+YL+' é '+compact(contab)+' (diferença de '+compact(dif)+'): o auxiliar baixa títulos que seguem em aberto no Razão. Vide Nota 18.':' Concilia com o saldo contábil ✓')+'</div></div>';
 }
 function postAging(key){
   const ag = DATA[key].aging;
@@ -2241,7 +2401,7 @@ function renderCP(){
   return '<div class="grid g4">'+
     kpi('Compromissos emitidos · '+yearLabel(), compact(d.emitido), 'brass', nf0.format(d.n)+' títulos')+
     kpi('Pago no período', compact(d.pago), 'pos', pct(d.pago/d.emitido)+' liquidado')+
-    kpi('Em aberto (emissão no período)', compact(d.aberto), d.aberto>0?'neg':'', 'Carteira total em aberto: '+compact(DATA.cp.aberto_total))+
+    kpi('Em aberto (emissão no período)', compact(d.aberto), d.aberto>0?'neg':'', 'Carteira no auxiliar: '+compact(DATA.cp.aberto_total)+' · saldo contábil 2.1.1.01: '+compact(BPV(isAll()?YL:state.year,'2.1.1.01')))+
     kpi('Prazo médio de pagamento', d.pmp.toLocaleString('pt-BR',{maximumFractionDigits:0})+' dias', 'steel', 'PMP · emissão → pagamento')+
   '</div>'+
   '<div class="grid g23 mt"><div class="card"><h3>Emissões de contas a pagar <span class="sub">'+(isAll()?'anual':'mensal · '+state.year)+'</span></h3>'+
@@ -2255,7 +2415,7 @@ function renderCR(){
   return '<div class="grid g4">'+
     kpi('Faturamento emitido · '+yearLabel(), compact(d.emitido), 'brass', nf0.format(d.n)+' títulos')+
     kpi('Recebido no período', compact(d.recebido), 'pos', pct(d.recebido/d.emitido)+' liquidado')+
-    kpi('Em aberto (emissão no período)', compact(d.aberto), d.aberto>0?'neg':'', 'Carteira total em aberto: '+compact(DATA.cr.aberto_total))+
+    kpi('Em aberto (emissão no período)', compact(d.aberto), d.aberto>0?'neg':'', 'Carteira no auxiliar: '+compact(DATA.cr.aberto_total)+' · saldo contábil 1.1.2.01: '+compact(BPV(isAll()?YL:state.year,COD.cli)))+
     kpi('Prazo médio de recebimento', d.pmr.toLocaleString('pt-BR',{maximumFractionDigits:0})+' dias', 'steel', 'PMR · emissão → recebimento')+
   '</div>'+
   '<div class="grid g23 mt"><div class="card"><h3>Emissões de contas a receber <span class="sub">'+(isAll()?'anual':'mensal · '+state.year)+'</span></h3>'+
@@ -2301,7 +2461,7 @@ function mutacaoMapa(key, labelAno, verb){
     const custoIni = antes.reduce((a,x)=>a+x.v,0);
     const adds = noAno.reduce((a,x)=>a+x.v,0);
     const custoFim = custoIni+adds;
-    const acumF = D[y].acum, acumI = y>2021 ? D[y-1].acum : {};
+    const acumF = D[y].acum, acumI = y>Y0 ? D[y-1].acum : {};
     const depIni = Object.values(acumI).reduce((a,v)=>a+v,0);
     const depFim = Object.values(acumF).reduce((a,v)=>a+v,0);
     const depPer = D[y][labelAno];
@@ -2321,7 +2481,7 @@ function mutacaoMapa(key, labelAno, verb){
 
 function assetView(key, labelAno, contaNome){
   const D = DATA[key];
-  const yEnd = isAll()?2025:state.year;
+  const yEnd = isAll()?YL:state.year;
   const cutoff = yEnd+'-12-31';
   const ativos = D.ativos.filter(a=>a.dt<=cutoff);
   const acum = D[yEnd].acum, resid = D[yEnd].resid;
@@ -2376,7 +2536,7 @@ function estoqueAgg(){
 }
 function renderEstoque(){
   const d = estoqueAgg();
-  const yEnd = isAll()?2025:state.year;
+  const yEnd = isAll()?YL:state.year;
   const saldoFim = DATA.estoque[yEnd].saldo[11];
   const pos = DATA.estoque.pos.slice().sort((a,b)=>b.v-a.v);
   const posTot = pos.reduce((a,p)=>a+p.v,0);
@@ -2394,7 +2554,7 @@ function renderEstoque(){
   '<div class="grid g2 mt"><div class="card"><h3>Saldo contábil do estoque <span class="sub">'+(isAll()?'fechamentos anuais':'mensal · '+state.year)+'</span></h3>'+
   '<div class="chartbox tall"><canvas id="ch-e1"></canvas></div></div>'+
   '<div class="card"><h3>Entradas × saídas <span class="sub">'+(isAll()?'anual':'mensal · '+state.year)+'</span></h3><div class="chartbox tall"><canvas id="ch-e2"></canvas></div></div></div>'+
-  '<div class="card mt"><h3>Posição por produto <span class="sub">inventário 31/12/2025 · '+compact(posTot)+'</span></h3>'+
+  '<div class="card mt"><h3>Posição por produto <span class="sub">inventário 31/12/'+YL+' · '+compact(posTot)+'</span></h3>'+
   '<div class="mt tbl-scroll"><table class="data"><tr><th>Produto</th><th>Categoria</th><th>Qtde</th><th>Mín / Alvo</th><th>Custo médio</th><th>Valor R$</th><th>Status</th></tr>'+rows+'</table></div></div>';
 }
 function postEstoque(){
@@ -2492,7 +2652,7 @@ function renderImp(){
   '<div class="chartbox tall"><canvas id="ch-i1"></canvas></div></div>'+
   '<div class="card"><h3>Por tributo <span class="sub">'+yearLabel()+'</span></h3><div class="chartbox tall"><canvas id="ch-i2"></canvas></div></div></div>'+
   '<div class="card mt"><h3>Memória de apuração <span class="sub">débitos × créditos por tributo · '+yearLabel()+'</span></h3>'+
-  '<div class="mt tbl-scroll"><table class="data"><tr><th>Tributo</th><th>Débitos (base)</th><th>Créditos apropriados</th><th>A recolher</th><th>% carga</th></tr>'+rows+'</table></div>'+
+  '<div class="mt tbl-scroll"><table class="data"><tr><th>Tributo</th><th>Débitos · base de cálculo (IRPJ/CSLL)</th><th>Créditos apropriados</th><th>A recolher</th><th>% carga</th></tr>'+rows+'</table></div>'+
   '<div class="section-note">Regime não cumulativo: créditos de ICMS, PIS (1,65%) e COFINS (7,6%) sobre compras compensam os débitos das saídas. IRPJ 15% + adicional de 10% sobre a parcela do lucro trimestral que excede R$ 60 mil · CSLL 9%.</div></div>'+
   lalurCard();
 }
